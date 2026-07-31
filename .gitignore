@@ -1,0 +1,25 @@
+# Ignore everything by default
+/*
+
+# Unignore deployment files and folders
+!/.gitignore
+!README.md
+!requirements.txt
+!app_fire_dt_ucayali.py
+!fire_digital_twin_ucayali.py
+!/.streamlit/
+!/.streamlit/config.toml
+!/data/
+!/data/firms_ucayali_2020_hoy.csv.gz
+!/data/last_update.json
+
+# But always exclude these
+data/firms_ucayali_2020_hoy.csv
+data/firms_api_key.txt
+outputs/
+__pycache__/
+*.pyc
+.DS_Store
+.streamlit/secrets.toml
+DL_FIRE_*/
+*.zip
