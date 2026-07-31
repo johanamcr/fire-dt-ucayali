@@ -150,10 +150,10 @@ def fetch_firms_api(days_back=10):
 
     sources = ['VIIRS_SNPP_NRT', 'VIIRS_NOAA20_NRT', 'VIIRS_NOAA21_NRT', 'MODIS_NRT']
     all_dfs = []
-    bbox = f"{LAT_MIN},{LON_MIN},{LAT_MAX},{LON_MAX}"
+    bbox = f"{LON_MIN},{LAT_MIN},{LON_MAX},{LAT_MAX}"
 
     for src in sources:
-        url = f"https://firms.modaps.eosdis.nasa.gov/api/area/csv/{api_key}/{src}/{days_back}/{bbox}"
+        url = f"https://firms.modaps.eosdis.nasa.gov/api/area/csv/{api_key}/{src}/{bbox}/{days_back}"
         try:
             r = requests.get(url, timeout=30)
             if r.status_code != 200:
@@ -177,7 +177,13 @@ def fetch_firms_api(days_back=10):
         (combined['latitude'] >= LAT_MIN) & (combined['latitude'] <= LAT_MAX) &
         (combined['longitude'] >= LON_MIN) & (combined['longitude'] <= LON_MAX)
     )
-    return combined[mask].copy()
+    combined = combined[mask].copy()
+
+    # Normalize column names to match archive data schema
+    col_map = {'bright_ti4': 'brightness', 'bright_ti5': 'bright_t31'}
+    combined = combined.rename(columns=col_map)
+    combined = combined.loc[:, ~combined.columns.duplicated()]
+    return combined
 
 
 def update_firms_data():
