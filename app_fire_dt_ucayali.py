@@ -30,6 +30,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import folium
+from folium.plugins import TimestampedGeoJson
 from streamlit_folium import st_folium
 import requests
 
@@ -394,6 +395,54 @@ def compute_spatial_risk(df, resolution=0.1):
     return density
 
 
+def build_timestamped_geojson(df, granularity='W', max_points=3000):
+    """Build a GeoJSON FeatureCollection with 'time' properties for the animated fire map.
+
+    Samples points evenly across time buckets so every period is represented,
+    keeping total points bounded for smooth animation performance.
+    """
+    if df.empty:
+        return None
+
+    df_sorted = df.sort_values('acq_date').copy()
+    df_sorted['_bucket'] = df_sorted['acq_date'].dt.to_period(granularity)
+
+    n_buckets = df_sorted['_bucket'].nunique()
+    per_bucket = max(1, int(max_points / n_buckets))
+
+    samples = []
+    for _, g in df_sorted.groupby('_bucket'):
+        samples.append(g.sample(min(per_bucket, len(g)), random_state=42))
+    sampled = pd.concat(samples).sort_values('acq_date').drop(columns=['_bucket'])
+
+    features = []
+    for _, row in sampled.iterrows():
+        conf = str(row.get('confidence', '')).lower()
+        color = '#e74c3c' if conf in ['high', 'nominal', 'h', 'n'] else '#f39c12'
+        features.append({
+            'type': 'Feature',
+            'geometry': {
+                'type': 'Point',
+                'coordinates': [float(row['longitude']), float(row['latitude'])]
+            },
+            'properties': {
+                'time': row['acq_date'].strftime('%Y-%m-%d'),
+                'frp': float(row.get('frp', 0) or 0),
+                'confidence': str(row.get('confidence', '')),
+                'style': {
+                    'color': color,
+                    'radius': 4,
+                    'weight': 1,
+                    'opacity': 0.9,
+                    'fillColor': color,
+                    'fillOpacity': 0.8
+                }
+            }
+        })
+
+    return {'type': 'FeatureCollection', 'features': features}
+
+
 # =============================================================================
 # STREAMLIT APP
 # =============================================================================
@@ -576,6 +625,53 @@ def main():
         m.get_root().html.add_child(folium.Element(legend_html))
 
         st_folium(m, width=1200, height=600)
+
+        st.markdown("---")
+        st.subheader("Animated Fire Map")
+        st.caption("Play the timeline to see how fire hotspots spread over the selected period. "
+                   "Use the speed slider to control playback pace.")
+
+        span_days = (filtered['acq_date'].max() - filtered['acq_date'].min()).days
+        if span_days <= 120:
+            default_anim = "Day"
+        elif span_days <= 730:
+            default_anim = "Week"
+        else:
+            default_anim = "Month"
+
+        granularity_opts = ["Day", "Week", "Month"]
+        anim_granularity = st.selectbox(
+            "Animation granularity",
+            granularity_opts,
+            index=granularity_opts.index(default_anim),
+            help="'Day' shows fine detail for short periods, 'Week' balances detail and speed, "
+                 "'Month' is best for multi-year overviews."
+        )
+
+        period_map = {"Day": "P1D", "Week": "P1W", "Month": "P1M"}
+        bucket_map = {"Day": 'D', "Week": 'W', "Month": 'M'}
+        geojson = build_timestamped_geojson(filtered, granularity=bucket_map[anim_granularity])
+
+        if geojson and len(geojson['features']) > 0:
+            m_anim = folium.Map(location=[-8.5, -74.5], zoom_start=7, tiles='CartoDB positron')
+            TimestampedGeoJson(
+                geojson,
+                period=period_map[anim_granularity],
+                transition_time=150,
+                loop=True,
+                auto_play=False,
+                add_last_point=False,
+                time_slider_drag_update=True,
+                speed_slider=True,
+                max_speed=20,
+                date_options='YYYY-MM-DD'
+            ).add_to(m_anim)
+            st_folium(m_anim, width=1200, height=600)
+            st.caption("The timeline advances one time step at a time. "
+                       "Red = high/nominal confidence, orange = low confidence. "
+                       "Points are sampled evenly across time steps for smooth performance.")
+        else:
+            st.info("No data in the selected range to animate.")
 
     # ---- TAB 2: TEMPORAL ANALYSIS ----
     with tab2:
