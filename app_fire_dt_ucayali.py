@@ -671,7 +671,7 @@ def main():
                 min_speed=0.1,
                 max_speed=10,
             ).add_to(m_anim)
-            st_folium(m_anim, width=1200, height=600)
+            st.iframe(m_anim._repr_html_(), width=1200, height=650)
             st.caption("Each frame = fire radiative power (FRP, MW) detected in that period. "
                        "Intensity is shown as a heat gradient: blue = low, green/yellow = moderate, "
                        "red = very intense. Use the time slider or play button to watch the evolution.")
