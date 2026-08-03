@@ -667,15 +667,36 @@ def main():
                 scale_radius=False,
                 auto_play=False,
                 display_index=True,
-                position='bottomright',
+                position='topright',
                 min_speed=0.1,
                 max_speed=10,
-                gradient={0.2: 'blue', 0.4: 'cyan', 0.6: 'lime', 0.8: 'yellow', 1.0: 'red'},
+                gradient={0.0: 'blue', 0.25: 'cyan', 0.5: 'lime', 0.75: 'yellow', 1.0: 'red'},
             ).add_to(m_anim)
-            st.iframe(m_anim._repr_html_(), width=1200, height=650)
-            st.caption("Each frame = fire radiative power (FRP, MW) detected in that period. "
-                       "Intensity is shown as a heat gradient: blue = low, green/yellow = moderate, "
-                       "red = very intense. Use the time slider or play button to watch the evolution.")
+
+            legend_html = """
+            <div style="position: fixed; bottom: 40px; left: 30px; z-index: 1000;
+                 background-color: white; padding: 10px 12px; border-radius: 8px;
+                 border: 2px solid #333; font-family: Arial; font-size: 12px;
+                 box-shadow: 2px 2px 6px rgba(0,0,0,0.3);">
+                <b>FIRE INTENSITY (FRP)</b><br>
+                <div style="width: 150px; height: 12px; border-radius: 3px; margin: 6px 0;
+                     background: linear-gradient(90deg, blue, cyan, lime, yellow, red);"></div>
+                <div style="display: flex; justify-content: space-between; width: 150px;">
+                    <span>Very low</span><span>Very high</span>
+                </div>
+                <div style="margin-top: 4px; color: #555; font-size: 10px;">
+                    Relative to the hottest fire in each time step
+                </div>
+            </div>
+            """
+            m_anim.get_root().html.add_child(folium.Element(legend_html))
+
+            st.iframe(m_anim.get_root().render(), width=1200, height=650)
+            st.caption("Each frame shows the fire radiative power (FRP, MW) detected in that period, "
+                       "i.e. the heat energy emitted by the fire as measured by the NASA sensor. "
+                       "Colors are normalized to the most intense fire in each time step: "
+                       "blue/cyan = very low/low intensity, green = medium, yellow = high, red = very high. "
+                       "Use the play button and time slider on the top-right to watch the evolution.")
         else:
             st.info("No data in the selected range to animate.")
 
