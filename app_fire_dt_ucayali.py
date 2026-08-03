@@ -660,16 +660,17 @@ def main():
             HeatMapWithTime(
                 heat_data,
                 index=heat_index,
-                radius=25,
-                blur=0.8,
-                min_opacity=0.1,
+                radius=7,
+                blur=0.6,
+                min_opacity=0.05,
                 max_opacity=0.75,
-                scale_radius=True,
+                scale_radius=False,
                 auto_play=False,
                 display_index=True,
                 position='bottomright',
                 min_speed=0.1,
                 max_speed=10,
+                gradient={0.2: 'blue', 0.4: 'cyan', 0.6: 'lime', 0.8: 'yellow', 1.0: 'red'},
             ).add_to(m_anim)
             st.iframe(m_anim._repr_html_(), width=1200, height=650)
             st.caption("Each frame = fire radiative power (FRP, MW) detected in that period. "
