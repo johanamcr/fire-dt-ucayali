@@ -30,11 +30,31 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import folium
-from folium.plugins import TimestampedGeoJson
+from folium.plugins import HeatMapWithTime
 from streamlit_folium import st_folium
 import requests
 
 warnings.filterwarnings('ignore')
+
+# Fix: folium's HeatMapWithTime computes map bounds incorrectly for time-series
+# data (each time step holds many points), which breaks streamlit_folium's
+# internal get_bounds() call. Patch the method once at startup.
+from folium.plugins import heat_map_withtime
+
+def _heatmap_self_bounds(self):
+    bounds = [[None, None], [None, None]]
+    for step in self.data:
+        for pt in step:
+            if len(pt) < 2:
+                continue
+            lat, lon = pt[0], pt[1]
+            bounds[0][0] = lat if bounds[0][0] is None else min(bounds[0][0], lat)
+            bounds[0][1] = lon if bounds[0][1] is None else min(bounds[0][1], lon)
+            bounds[1][0] = lat if bounds[1][0] is None else max(bounds[1][0], lat)
+            bounds[1][1] = lon if bounds[1][1] is None else max(bounds[1][1], lon)
+    return bounds
+
+heat_map_withtime.HeatMapWithTime._get_self_bounds = _heatmap_self_bounds
 
 # =============================================================================
 # CONFIGURATION
@@ -395,14 +415,13 @@ def compute_spatial_risk(df, resolution=0.1):
     return density
 
 
-def build_timestamped_geojson(df, granularity='W', max_points=3000):
-    """Build a GeoJSON FeatureCollection with 'time' properties for the animated fire map.
-
-    Samples points evenly across time buckets so every period is represented,
-    keeping total points bounded for smooth animation performance.
+def build_heatmap_time_data(df, granularity='W', max_points=8000):
+    """Build (data, index) for HeatMapWithTime: a list of time steps, each with
+    [lat, lon, intensity] points where intensity = fire radiative power (FRP).
+    Sampling is balanced across time buckets so every step is represented.
     """
     if df.empty:
-        return None
+        return [], []
 
     df_sorted = df.sort_values('acq_date').copy()
     df_sorted['_bucket'] = df_sorted['acq_date'].dt.to_period(granularity)
@@ -410,37 +429,21 @@ def build_timestamped_geojson(df, granularity='W', max_points=3000):
     n_buckets = df_sorted['_bucket'].nunique()
     per_bucket = max(1, int(max_points / n_buckets))
 
-    samples = []
-    for _, g in df_sorted.groupby('_bucket'):
-        samples.append(g.sample(min(per_bucket, len(g)), random_state=42))
-    sampled = pd.concat(samples).sort_values('acq_date').drop(columns=['_bucket'])
+    if 'frp' in df_sorted.columns:
+        df_sorted['_intensity'] = df_sorted['frp'].fillna(0).clip(lower=0.5)
+    else:
+        df_sorted['_intensity'] = 1.0
 
-    features = []
-    for _, row in sampled.iterrows():
-        conf = str(row.get('confidence', '')).lower()
-        color = '#e74c3c' if conf in ['high', 'nominal', 'h', 'n'] else '#f39c12'
-        features.append({
-            'type': 'Feature',
-            'geometry': {
-                'type': 'Point',
-                'coordinates': [float(row['longitude']), float(row['latitude'])]
-            },
-            'properties': {
-                'time': row['acq_date'].strftime('%Y-%m-%d'),
-                'frp': float(row.get('frp', 0) or 0),
-                'confidence': str(row.get('confidence', '')),
-                'style': {
-                    'color': color,
-                    'radius': 4,
-                    'weight': 1,
-                    'opacity': 0.9,
-                    'fillColor': color,
-                    'fillOpacity': 0.8
-                }
-            }
-        })
+    data, index = [], []
+    label_fmt = '%Y-%m' if granularity == 'M' else '%Y-%m-%d'
+    for b, g in df_sorted.groupby('_bucket'):
+        sample = g.sample(min(per_bucket, len(g)), random_state=42)
+        pts = [[lat, lon, intensity] for lat, lon, intensity in
+               zip(sample['latitude'], sample['longitude'], sample['_intensity'])]
+        data.append(pts)
+        index.append(b.start_time.strftime(label_fmt))
 
-    return {'type': 'FeatureCollection', 'features': features}
+    return data, index
 
 
 # =============================================================================
@@ -627,9 +630,10 @@ def main():
         st_folium(m, width=1200, height=600)
 
         st.markdown("---")
-        st.subheader("Animated Fire Map")
-        st.caption("Play the timeline to see how fire hotspots spread over the selected period. "
-                   "Use the speed slider to control playback pace.")
+        st.subheader("Animated Fire Heat Map")
+        st.caption("Watch how fire intensity (heat) concentrates and spreads across Ucayali over time. "
+                   "Colors go from blue (low intensity) to red (very intense fires), so you can see "
+                   "where and when fire fronts concentrate.")
 
         span_days = (filtered['acq_date'].max() - filtered['acq_date'].min()).days
         if span_days <= 120:
@@ -648,28 +652,29 @@ def main():
                  "'Month' is best for multi-year overviews."
         )
 
-        period_map = {"Day": "P1D", "Week": "P1W", "Month": "P1M"}
         bucket_map = {"Day": 'D', "Week": 'W', "Month": 'M'}
-        geojson = build_timestamped_geojson(filtered, granularity=bucket_map[anim_granularity])
+        heat_data, heat_index = build_heatmap_time_data(filtered, granularity=bucket_map[anim_granularity])
 
-        if geojson and len(geojson['features']) > 0:
+        if heat_data:
             m_anim = folium.Map(location=[-8.5, -74.5], zoom_start=7, tiles='CartoDB positron')
-            TimestampedGeoJson(
-                geojson,
-                period=period_map[anim_granularity],
-                transition_time=150,
-                loop=True,
+            HeatMapWithTime(
+                heat_data,
+                index=heat_index,
+                radius=25,
+                blur=0.8,
+                min_opacity=0.1,
+                max_opacity=0.75,
+                scale_radius=True,
                 auto_play=False,
-                add_last_point=False,
-                time_slider_drag_update=True,
-                speed_slider=True,
-                max_speed=20,
-                date_options='YYYY-MM-DD'
+                display_index=True,
+                position='bottomright',
+                min_speed=0.1,
+                max_speed=10,
             ).add_to(m_anim)
             st_folium(m_anim, width=1200, height=600)
-            st.caption("The timeline advances one time step at a time. "
-                       "Red = high/nominal confidence, orange = low confidence. "
-                       "Points are sampled evenly across time steps for smooth performance.")
+            st.caption("Each frame = fire radiative power (FRP, MW) detected in that period. "
+                       "Intensity is shown as a heat gradient: blue = low, green/yellow = moderate, "
+                       "red = very intense. Use the time slider or play button to watch the evolution.")
         else:
             st.info("No data in the selected range to animate.")
 
