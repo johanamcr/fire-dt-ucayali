@@ -581,55 +581,6 @@ def main():
 
     # ---- TAB 1: FIRE MAP ----
     with tab1:
-        st.subheader("Fire Hotspot Map")
-        st.caption("Interactive map showing all detected fire hotspots. Click markers for details.")
-
-        m = folium.Map(location=[-8.5, -74.5], zoom_start=7, tiles='CartoDB positron')
-
-        # Add markers
-        for year in sorted(filtered['year'].unique()):
-            year_df = filtered[filtered['year'] == year]
-            fg = folium.FeatureGroup(name=f'{year} ({len(year_df):,})')
-            sample = year_df.sample(min(500, len(year_df)), random_state=42)
-
-            for _, row in sample.iterrows():
-                conf = str(row.get('confidence', '')).lower()
-                color = 'red' if conf in ['high', 'nominal', 'h', 'n'] else 'orange'
-                popup = f"""
-                <b>{row['acq_date'].strftime('%d/%m/%Y')}</b><br>
-                <b>FRP:</b> {row.get('frp', 'N/A')} MW<br>
-                <b>Confidence:</b> {row.get('confidence', 'N/A')}<br>
-                <b>Sensor:</b> {row.get('_source', 'N/A')}<br>
-                <b>Zone:</b> {row.get('zone', 'N/A')}<br>
-                <b>Coords:</b> {row['latitude']:.4f}, {row['longitude']:.4f}
-                """
-                folium.CircleMarker(
-                    location=[row['latitude'], row['longitude']],
-                    radius=2, color=color, fill=True, fill_opacity=0.5,
-                    popup=folium.Popup(popup, max_width=250)
-                ).add_to(fg)
-            fg.add_to(m)
-
-        folium.LayerControl().add_to(m)
-
-        # Legend
-        legend_html = """
-        <div style="position: fixed; bottom: 30px; left: 30px; z-index: 1000;
-             background-color: white; padding: 12px; border-radius: 8px;
-             border: 2px solid #333; font-family: Arial; font-size: 12px;
-             box-shadow: 2px 2px 6px rgba(0,0,0,0.3);">
-            <b>LEGEND</b><br>
-            <span style="color: red;">●</span> High/Nominal confidence<br>
-            <span style="color: orange;">●</span> Low confidence<br>
-            <span style="font-size:10px; color:#666;">FRP = Fire Radiative Power (MW)<br>
-            Toggle years in layer control</span>
-        </div>
-        """
-        m.get_root().html.add_child(folium.Element(legend_html))
-
-        st_folium(m, width=1200, height=600)
-
-        st.markdown("---")
         st.subheader("Animated Fire Heat Map")
         st.caption("Watch how fire intensity (heat) concentrates and spreads across Ucayali over time. "
                    "Colors go from blue (low intensity) to red (very intense fires), so you can see "
@@ -699,6 +650,61 @@ def main():
                        "Use the play button and time slider on the top-right to watch the evolution.")
         else:
             st.info("No data in the selected range to animate.")
+
+        st.markdown("---")
+        st.subheader("Fire Hotspot Map")
+        st.caption("Interactive map showing all detected fire hotspots in the selected period. "
+                   "Click markers for details. Markers are colored by detection confidence.")
+
+        m = folium.Map(location=[-8.5, -74.5], zoom_start=7, tiles='CartoDB positron')
+
+        # Add markers
+        for year in sorted(filtered['year'].unique()):
+            year_df = filtered[filtered['year'] == year]
+            fg = folium.FeatureGroup(name=f'{year} ({len(year_df):,})')
+            sample = year_df.sample(min(500, len(year_df)), random_state=42)
+
+            for _, row in sample.iterrows():
+                conf = str(row.get('confidence', '')).lower()
+                if conf in ['h', 'high', 'n', 'nominal']:
+                    color = 'red'
+                elif conf.isdigit() and int(conf) >= 80:
+                    color = 'red'
+                else:
+                    color = 'orange'
+                popup = f"""
+                <b>{row['acq_date'].strftime('%d/%m/%Y')}</b><br>
+                <b>FRP:</b> {row.get('frp', 'N/A')} MW<br>
+                <b>Confidence:</b> {row.get('confidence', 'N/A')}<br>
+                <b>Sensor:</b> {row.get('_source', 'N/A')}<br>
+                <b>Zone:</b> {row.get('zone', 'N/A')}<br>
+                <b>Coords:</b> {row['latitude']:.4f}, {row['longitude']:.4f}
+                """
+                folium.CircleMarker(
+                    location=[row['latitude'], row['longitude']],
+                    radius=2, color=color, fill=True, fill_opacity=0.5,
+                    popup=folium.Popup(popup, max_width=250)
+                ).add_to(fg)
+            fg.add_to(m)
+
+        folium.LayerControl().add_to(m)
+
+        # Legend
+        legend_html = """
+        <div style="position: fixed; bottom: 30px; left: 30px; z-index: 1000;
+             background-color: white; padding: 12px; border-radius: 8px;
+             border: 2px solid #333; font-family: Arial; font-size: 12px;
+             box-shadow: 2px 2px 6px rgba(0,0,0,0.3);">
+            <b>LEGEND</b><br>
+            <span style="color: red;">●</span> High/Nominal confidence (VIIRS) or ≥80% (MODIS)<br>
+            <span style="color: orange;">●</span> Low confidence<br>
+            <span style="font-size:10px; color:#666;">Click markers for details.<br>
+            Toggle years in layer control.</span>
+        </div>
+        """
+        m.get_root().html.add_child(folium.Element(legend_html))
+
+        st_folium(m, width=1200, height=600)
 
     # ---- TAB 2: TEMPORAL ANALYSIS ----
     with tab2:
