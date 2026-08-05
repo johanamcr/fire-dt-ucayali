@@ -1,13 +1,16 @@
-streamlit>=1.50
-pandas>=1.5
-numpy>=1.23
-plotly>=5.14
-folium>=0.14
-streamlit-folium>=0.16
-requests>=2.28
-dbfread>=2.0
-# REQUIRED by Streamlit custom components (st_folium) - both apps use st_folium.
-# Upper bound <25 matches streamlit's own pyarrow<25 requirement.
-pyarrow>=15.0,<25
-matplotlib>=3.6
-seaborn>=0.12
+streamlit==1.61.0
+streamlit-folium==0.27.4
+pandas==3.0.5
+numpy==2.4.6
+plotly==6.9.0
+folium==0.20.0
+requests==2.34.2
+dbfread==2.0.7
+pyarrow==24.0.0
+matplotlib==3.11.1
+seaborn==0.13.2
+# Fixed: streamlit 1.61's gzip middleware is incompatible with starlette>=1.0
+# (GZipResponder requires thread_minimum_size) -> every HTTP request returns 500.
+# Keep starlette<1 and the matching uvicorn.
+starlette==0.52.1
+uvicorn==0.52.1
