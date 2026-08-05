@@ -6,6 +6,8 @@ folium>=0.14
 streamlit-folium>=0.16
 requests>=2.28
 dbfread>=2.0
-pyarrow>=15.0
+# REQUIRED by Streamlit custom components (st_folium) - both apps use st_folium.
+# Upper bound <25 matches streamlit's own pyarrow<25 requirement.
+pyarrow>=15.0,<25
 matplotlib>=3.6
 seaborn>=0.12

@@ -59,7 +59,7 @@ DATA_DIR = BASE_DIR / 'data'
 CONTEXT_DIR = DATA_DIR / 'context'
 
 FIRMS_PATH = DATA_DIR / 'firms_peru_2020_hoy.parquet'
-FIRMS_CSV = DATA_DIR / 'firms_peru_2020_hoy.csv.gz'
+FIRMS_CSV = DATA_DIR / 'firms_peru_2020_hoy_compact.csv.gz'
 UPDATE_LOG = DATA_DIR / 'last_update_firms_peru.json'
 
 def _first_existing(*names):
@@ -103,11 +103,19 @@ PRIORITY_MAX_POINTS = 30000
 
 @st.cache_resource(show_spinner='Cargando FIRMS nacional...')
 def load_firms():
+    df = None
     if FIRMS_PATH.exists():
-        df = pd.read_parquet(FIRMS_PATH)
-    elif FIRMS_CSV.exists():
-        df = pd.read_csv(FIRMS_CSV, compression='gzip', low_memory=False)
-    else:
+        try:
+            df = pd.read_parquet(FIRMS_PATH)
+        except Exception:
+            df = None
+    if df is None and FIRMS_CSV.exists():
+        df = pd.read_csv(FIRMS_CSV, compression='gzip', low_memory=False,
+                         parse_dates=['acq_date'])
+        for c in ('confidence', '_source', 'fp_reason', 'zone'):
+            df[c] = df[c].astype('category')
+        df['is_valid'] = df['is_valid'].astype(bool)
+    if df is None:
         return None
     df['acq_date'] = pd.to_datetime(df['acq_date'])
     return df
