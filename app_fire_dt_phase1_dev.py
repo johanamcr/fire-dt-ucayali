@@ -16,12 +16,14 @@ Run:  streamlit run app_fire_dt_phase1_dev.py
 import json
 import os
 import sys
+import time
 import warnings
 from datetime import timedelta
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 import plotly.express as px
 import folium
@@ -465,9 +467,9 @@ def compute_deforest_proximity(df, def_df, radius_km=DEF_NEAR_KM):
     """Distance (km) from each hotspot to the nearest deforestation alert."""
     out = df.copy()
     out['nearest_def_km'] = np.nan
-    out['nearest_def_date'] = ''
+    out['nearest_def_date'] = None
     out['nearest_def_area'] = np.nan
-    out['nearest_def_code'] = 0
+    out['nearest_def_code'] = None
     if df.empty or def_df is None or len(def_df) == 0:
         return out
     lat = df['latitude'].values
@@ -476,12 +478,15 @@ def compute_deforest_proximity(df, def_df, radius_km=DEF_NEAR_KM):
     d, i = nearest_centroid_bucketed(lat, lon, def_df['lat'].values,
                                      def_df['lon'].values, buckets)
     within = d <= radius_km
+    dates = pd.to_datetime(def_df['published_at'].values[i]).strftime('%d/%m/%Y')
     out['nearest_def_km'] = np.round(d, 1)
     out['nearest_def_code'] = def_df['alert_code'].values[i]
-    out['nearest_def_date'] = def_df['published_at'].values[i]
+    out['nearest_def_date'] = dates
     out['nearest_def_area'] = def_df['area_ha'].values[i]
-    out.loc[~within, ['nearest_def_km', 'nearest_def_code',
-                      'nearest_def_date', 'nearest_def_area']] = [np.nan, 0, '', np.nan]
+    out.loc[~within, 'nearest_def_km'] = np.nan
+    out.loc[~within, 'nearest_def_code'] = None
+    out.loc[~within, 'nearest_def_date'] = None
+    out.loc[~within, 'nearest_def_area'] = np.nan
     return out
 
 
@@ -620,7 +625,7 @@ def build_hotspot_map(df, com_cent, com_polys, anp_polys, dpt_polys, dpt_names,
         if 'nearest_def_km' in row.index and pd.notna(row.get('nearest_def_km')):
             def_line = (f"<br><b style='color:#8e24aa;'>Def. reciente:</b> "
                         f"alerta {row.get('nearest_def_code', '')} "
-                        f"({row.get('nearest_def_date', ''):%d/%m/%Y}, "
+                        f"({row.get('nearest_def_date', '')}, "
                         f"{row.get('nearest_def_area', 0):.1f} ha) a "
                         f"{row.get('nearest_def_km', 0):.1f} km "
                         f"(posible quema post-tala)")
@@ -678,6 +683,159 @@ def build_hotspot_map(df, com_cent, com_polys, anp_polys, dpt_polys, dpt_names,
 
 
 # =============================================================================
+# PHASE 3 - ASSISTANT (Claude API + tool use, solo datos reales)
+# =============================================================================
+
+ASSISTANT_SYSTEM = (
+    'Eres el asistente de datos del Digital Twin de Incendios Forestales del '
+    'Peru. Respondes EXCLUSIVAMENTE con datos reales devueltos por tus '
+    'herramientas. Si una herramienta no devuelve datos, responde: "No tengo '
+    'datos sobre eso." Nunca inventes cifras, fechas, departamentos ni fuentes. '
+    'Cita siempre la fuente (FIRMS/NASA o MapBiomas Alerta Peru) y la fecha del '
+    'dato. Responde en espanol, corto y concreto, en 2-4 frases.')
+
+ASSISTANT_TOOLS = [
+    {
+        'name': 'consultar_focos_calor',
+        'description': 'Consulta focos de calor FIRMS/NASA de todo el Peru '
+                       '(2020-presente). Devuelve totales, periodo, ultimos 30 '
+                       'dias, FRP medio, mes pico y top de departamentos.',
+        'input_schema': {
+            'type': 'object',
+            'properties': {
+                'departamento': {'type': 'string',
+                                 'description': 'Departamento peruano (p.ej. '
+                                                'Ucayali). Opcional.'},
+                'fecha_inicio': {'type': 'string',
+                                 'description': 'Fecha inicio YYYY-MM-DD. '
+                                                'Opcional.'},
+                'fecha_fin': {'type': 'string',
+                              'description': 'Fecha fin YYYY-MM-DD. Opcional.'},
+            },
+        },
+    },
+    {
+        'name': 'consultar_deforestacion',
+        'description': 'Consulta alertas de deforestacion de MapBiomas Alerta '
+                       'Peru. Devuelve total de alertas, area, publicaciones '
+                       'recientes y top por departamento.',
+        'input_schema': {
+            'type': 'object',
+            'properties': {
+                'departamento': {'type': 'string',
+                                 'description': 'Departamento peruano (p.ej. '
+                                                'Ucayali). Opcional.'},
+                'dias': {'type': 'integer',
+                         'description': 'Ventana de dias para "recientes" '
+                                        '(default 60). Opcional.'},
+            },
+        },
+    },
+]
+
+
+def assign_dept_to_points(lat, lon, dpt_polys, dpt_names):
+    """Department names per (lat, lon) point via bucketed point-in-polygon."""
+    rings = [{'bbox': [r[:, 0].min(), r[:, 1].min(), r[:, 0].max(), r[:, 1].max()],
+              'path': _downsample(r, 150), 'name': nm}
+             for r, nm in zip(dpt_polys, dpt_names)]
+    buckets = build_polygon_buckets(rings)
+    inside = inside_polygons_batched(lat, lon, rings, buckets)
+    return ['; '.join(h) for h in inside]
+
+
+def tool_focos_calor(df, departamento=None, fecha_inicio=None, fecha_fin=None):
+    sub = df
+    if departamento:
+        sub = sub[sub['zone'].str.lower() == departamento.strip().lower()]
+    if fecha_inicio:
+        sub = sub[sub['acq_date'] >= pd.to_datetime(fecha_inicio)]
+    if fecha_fin:
+        sub = sub[sub['acq_date'] <= pd.to_datetime(fecha_fin)]
+    if sub.empty:
+        return 'Sin datos de focos de calor con esos filtros.'
+    valid = sub[sub['is_valid']]
+    if valid.empty:
+        return 'Sin focos validos con esos filtros.'
+    last30 = valid[valid['acq_date'] >= valid['acq_date'].max() - pd.Timedelta(days=30)]
+    top = valid.groupby('zone').size().sort_values(ascending=False).head(5)
+    lines = [
+        f'Total focos validos: {len(valid):,}',
+        f'Periodo: {valid["acq_date"].min():%d/%m/%Y} a '
+        f'{valid["acq_date"].max():%d/%m/%Y}',
+        f'Ultimos 30 dias: {len(last30):,}',
+        f'FRP medio: {valid["frp"].mean():.1f} MW',
+        f'Mes pico: {MONTH_NAMES[valid["acq_date"].dt.month.value_counts().idxmax()]}',
+        'Top departamentos: ' + ', '.join(f'{d} ({n:,})' for d, n in top.items()),
+        f'Fuente: FIRMS/NASA. Ultimo dato: {valid["acq_date"].max():%d/%m/%Y}.',
+    ]
+    return '\n'.join(lines)
+
+
+def tool_deforestacion(def_df, departamento=None, dias=60):
+    if def_df is None or def_df.empty:
+        return 'Datos de deforestacion no disponibles.'
+    sub = def_df.copy()
+    if 'zona' in sub.columns and departamento:
+        sub = sub[sub['zona'].str.lower().str.contains(
+            departamento.strip().lower(), na=False)]
+    if sub.empty:
+        return f'Sin alertas de deforestacion con esos filtros.'
+    ref = sub['published_at'].max()
+    recent = sub[sub['published_at'] >= ref - pd.Timedelta(days=dias)]
+    group_col = 'zona' if 'zona' in sub.columns else 'published_at'
+    top = sub.groupby(group_col).size().sort_values(ascending=False).head(5)
+    lines = [
+        f'Alertas en dataset: {len(sub):,}',
+        f'Area total: {sub["area_ha"].sum():,.0f} ha',
+        f'Ultimas {dias} dias: {len(recent):,}',
+        f'Ultima publicacion: {ref:%d/%m/%Y}',
+        'Top por departamento: ' + ', '.join(f'{d} ({n:,})' for d, n in top.items()),
+        'Fuente: MapBiomas Alerta Peru (WFS publico).',
+    ]
+    return '\n'.join(lines)
+
+
+def run_assistant_loop(history, tool_map, api_key):
+    """Claude Messages API + tool use; resolves tools and returns final text."""
+    api_msgs = [{'role': r, 'content': t} for r, t in history if t]
+    url = 'https://api.anthropic.com/v1/messages'
+    headers = {'x-api-key': api_key, 'anthropic-version': '2023-06-01',
+               'content-type': 'application/json'}
+    for _ in range(6):
+        body = {'model': 'claude-3-5-haiku-latest', 'max_tokens': 1024,
+                'system': ASSISTANT_SYSTEM, 'tools': ASSISTANT_TOOLS,
+                'messages': api_msgs}
+        try:
+            r = requests.post(url, headers=headers, json=body, timeout=180)
+        except requests.exceptions.RequestException as e:
+            return f'Error al consultar la API: {e}'
+        if r.status_code == 429:
+            time.sleep(5)
+            continue
+        if r.status_code != 200:
+            return (f'Error de la API ({r.status_code}). Revisa que '
+                    f'ANTHROPIC_API_KEY sea valida y tenga saldo.')
+        data = r.json()
+        if data.get('stop_reason') != 'tool_use':
+            parts = [b.get('text', '') for b in data.get('content', [])
+                     if b.get('type') == 'text']
+            return ('\n'.join(parts)).strip() or 'No tengo datos sobre eso.'
+        api_msgs.append({'role': 'assistant', 'content': data['content']})
+        for block in data['content']:
+            if block.get('type') != 'tool_use':
+                continue
+            name, args = block['name'], block.get('input') or {}
+            result = (tool_map[name](**args) if name in tool_map
+                      else 'Herramienta desconocida')
+            api_msgs.append({'role': 'user', 'content': [{
+                'type': 'tool_result', 'tool_use_id': block['id'],
+                'content': str(result)[:8000],
+            }]})
+    return 'No pude completar la consulta. Intenta de nuevo.'
+
+
+# =============================================================================
 # STREAMLIT APP
 # =============================================================================
 
@@ -714,6 +872,11 @@ def main():
                  'scripts/build_firms_peru.py primero.')
         st.stop()
     def_recent, def_ref = recent_deforest(def_all, DEF_DAYS)
+    if def_all is not None and len(def_all) and 'zona' not in def_all.columns:
+        with st.spinner('Asignando departamentos a las alertas de deforestacion...'):
+            def_all['zona'] = assign_dept_to_points(
+                def_all['lat'].values, def_all['lon'].values,
+                dpt_polys, dpt_names)
 
     # Precompute grids once
     com_buckets = build_centroid_buckets(com_cent['centroid_lat'].values,
@@ -790,9 +953,9 @@ def main():
             prio_set, com_cent, com_polys, anp_polys,
             com_buckets, poly_buckets_anp, poly_buckets_com, poly_buckets_anp))
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
         ['Mapa de focos', 'Priorizacion', 'Falsos positivos', 'Resumen',
-         'Deforestacion'])
+         'Deforestacion', 'Asistente'])
 
     # ---------------- TAB 1: MAP ----------------
     with tab1:
@@ -904,6 +1067,12 @@ def main():
             'nearest_def_date': 'Alerta def. publicada', 'nearest_def_area': 'Alerta def. (ha)'
         })
         disp['Fecha'] = disp['Fecha'].dt.strftime('%d/%m/%Y')
+        if 'Def. reciente (km)' in disp:
+            disp['Def. reciente (km)'] = disp['Def. reciente (km)'].map(
+                lambda x: f'{x:.1f}' if pd.notna(x) else '')
+        if 'Alerta def. (ha)' in disp:
+            disp['Alerta def. (ha)'] = disp['Alerta def. (ha)'].map(
+                lambda x: f'{x:.0f}' if pd.notna(x) else '')
         disp = disp.fillna('')
         st.dataframe(disp, height=520, width='stretch')
 
@@ -1006,17 +1175,21 @@ def main():
                     'espacio-temporal (tala en estacion seca + quema semanas despues) '
                     'es consistente con **quemas post-tala** (patron MAAP).')
                 near_disp = prox[prox['nearest_def_km'].notna()][[
-                    'acq_date', 'zone', 'latitude', 'longitude', 'frp', 'tier',
+                    'acq_date', 'zone', 'latitude', 'longitude', 'frp',
                     'nearest_def_km', 'nearest_def_code', 'nearest_def_date',
                     'nearest_def_area'
                 ]].sort_values('nearest_def_km').head(200).rename(columns={
                     'acq_date': 'Fuego (fecha)', 'zone': 'Departamento',
                     'latitude': 'Lat', 'longitude': 'Lon', 'frp': 'FRP (MW)',
-                    'tier': 'Prioridad', 'nearest_def_km': 'Dist. alerta (km)',
+                    'nearest_def_km': 'Dist. alerta (km)',
                     'nearest_def_code': 'Cod. alerta', 'nearest_def_date': 'Alerta publicada',
                     'nearest_def_area': 'Area alerta (ha)'
                 })
                 near_disp['Fuego (fecha)'] = near_disp['Fuego (fecha)'].dt.strftime('%d/%m/%Y')
+                near_disp['Dist. alerta (km)'] = near_disp['Dist. alerta (km)'].map(
+                    lambda x: f'{x:.1f}' if pd.notna(x) else '')
+                near_disp['Area alerta (ha)'] = near_disp['Area alerta (ha)'].map(
+                    lambda x: f'{x:.1f}' if pd.notna(x) else '')
                 st.dataframe(near_disp, height=420, width='stretch')
 
             st.markdown('---')
@@ -1162,6 +1335,44 @@ def main():
             st.caption(f"Ultima actualizacion dataset: {info.get('updated_at', 'N/A')} | "
                        f"Datos hasta: {info.get('last_date', 'N/A')} | "
                        f"Registros: {info.get('total_records', 0):,}")
+
+    # ---------------- TAB 6: ASSISTANT ----------------
+    with tab6:
+        st.subheader('Asistente de datos (IA)')
+        st.caption('Responde SOLO con datos reales de este Digital Twin '
+                   '(FIRMS/NASA y MapBiomas Alerta Peru). Si no tiene datos, lo '
+                   'dice y nunca inventa cifras. Fuente y fecha siempre citadas.')
+        try:
+            api_key = st.secrets.get('ANTHROPIC_API_KEY', '')
+        except Exception:
+            api_key = ''
+        if not api_key:
+            st.warning('Asistente desactivado: falta la API key de Anthropic '
+                       '(ANTHROPIC_API_KEY en los secrets de la app).')
+        else:
+            tool_map = {
+                'consultar_focos_calor':
+                    lambda **kw: tool_focos_calor(df, **kw),
+                'consultar_deforestacion':
+                    lambda **kw: tool_deforestacion(def_all, **kw),
+            }
+            if 'chat_history' not in st.session_state:
+                st.session_state.chat_history = []
+            for role, text in st.session_state.chat_history:
+                with st.chat_message(role):
+                    st.markdown(text)
+            prompt = st.chat_input('Pregunta, p.ej.: "Cuantos focos hubo en Ucayali '
+                                   'este ano?" o "Hay deforestacion reciente cerca '
+                                   'de mis focos de calor?"')
+            if prompt:
+                st.chat_message('user').markdown(prompt)
+                st.session_state.chat_history.append(('user', prompt))
+                with st.chat_message('assistant'):
+                    with st.spinner('Consultando datos reales...'):
+                        answer = run_assistant_loop(
+                            st.session_state.chat_history, tool_map, api_key)
+                    st.markdown(answer)
+                st.session_state.chat_history.append(('assistant', answer))
 
 
 if __name__ == '__main__':
