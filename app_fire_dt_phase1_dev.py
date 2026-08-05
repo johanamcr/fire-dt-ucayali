@@ -480,7 +480,7 @@ def compute_deforest_proximity(df, def_df, radius_km=DEF_NEAR_KM):
     within = d <= radius_km
     dates = pd.to_datetime(def_df['published_at'].values[i]).strftime('%d/%m/%Y')
     out['nearest_def_km'] = np.round(d, 1)
-    out['nearest_def_code'] = def_df['alert_code'].values[i]
+    out['nearest_def_code'] = def_df['alert_code'].astype(str).values[i]
     out['nearest_def_date'] = dates
     out['nearest_def_area'] = def_df['area_ha'].values[i]
     out.loc[~within, 'nearest_def_km'] = np.nan
