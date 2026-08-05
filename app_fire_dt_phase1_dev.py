@@ -694,6 +694,35 @@ ASSISTANT_SYSTEM = (
     'Cita siempre la fuente (FIRMS/NASA o MapBiomas Alerta Peru) y la fecha del '
     'dato. Responde en espanol, corto y concreto, en 2-4 frases.')
 
+ASSISTANT_KEY_CANDIDATES = ('ANTHROPIC_API_KEY', 'anthropic_api_key',
+                            'ANTHROPIC_KEY', 'anthropic_key', 'CLAUDE_API_KEY')
+
+
+def get_anthropic_key():
+    """Find the Anthropic API key in st.secrets (any casing/section) or env."""
+    try:
+        secrets = st.secrets
+    except Exception:
+        secrets = {}
+    for pool in (secrets, os.environ):
+        try:
+            for name in ASSISTANT_KEY_CANDIDATES:
+                v = pool.get(name, '')
+                if v:
+                    return str(v).strip()
+        except Exception:
+            continue
+    try:
+        for _section, vals in st.secrets.items():
+            if isinstance(vals, dict):
+                for name in ASSISTANT_KEY_CANDIDATES:
+                    v = vals.get(name, '')
+                    if v:
+                        return str(v).strip()
+    except Exception:
+        pass
+    return ''
+
 ASSISTANT_TOOLS = [
     {
         'name': 'consultar_focos_calor',
@@ -1342,14 +1371,20 @@ def main():
         st.caption('Responde SOLO con datos reales de este Digital Twin '
                    '(FIRMS/NASA y MapBiomas Alerta Peru). Si no tiene datos, lo '
                    'dice y nunca inventa cifras. Fuente y fecha siempre citadas.')
-        try:
-            api_key = st.secrets.get('ANTHROPIC_API_KEY', '')
-        except Exception:
-            api_key = ''
+        api_key = get_anthropic_key()
         if not api_key:
-            st.warning('Asistente desactivado: falta la API key de Anthropic '
-                       '(ANTHROPIC_API_KEY en los secrets de la app).')
+            st.warning(
+                '**Asistente desactivado: falta la API key de Anthropic.**\n\n'
+                'Para activarlo en **Streamlit Cloud**:\n'
+                '1. Abre **esta app** (fire-dt-ucayali-owy9tde2pauka5m9xjlgy4) '
+                'y entra a **Settings > Secrets**.\n'
+                '2. Agrega la linea:\n\n'
+                '```toml\nANTHROPIC_API_KEY = "sk-ant-..."\n```\n\n'
+                '3. Presiona **Save**. La app se reinicia sola; si no, '
+                'recarga la pagina. (Tambien acepta anthropic_api_key o '
+                'ANTHROPIC_KEY, y variables de entorno.)')
         else:
+            st.caption('Asistente conectado (clave cargada).')
             tool_map = {
                 'consultar_focos_calor':
                     lambda **kw: tool_focos_calor(df, **kw),
