@@ -696,17 +696,20 @@ ASSISTANT_SYSTEM = (
 
 ASSISTANT_KEY_CANDIDATES = ('ANTHROPIC_API_KEY', 'anthropic_api_key',
                             'ANTHROPIC_KEY', 'anthropic_key', 'CLAUDE_API_KEY')
+GEMINI_KEY_CANDIDATES = ('GEMINI_API_KEY', 'gemini_api_key',
+                         'GOOGLE_API_KEY', 'google_api_key', 'GEMINI_KEY')
+GEMINI_MODEL = 'gemini-2.5-flash'
 
 
-def get_anthropic_key():
-    """Find the Anthropic API key in st.secrets (any casing/section) or env."""
+def get_secret_key(candidates):
+    """Find a key in st.secrets (any casing/section) or env vars."""
     try:
         secrets = st.secrets
     except Exception:
         secrets = {}
     for pool in (secrets, os.environ):
         try:
-            for name in ASSISTANT_KEY_CANDIDATES:
+            for name in candidates:
                 v = pool.get(name, '')
                 if v:
                     return str(v).strip()
@@ -715,13 +718,21 @@ def get_anthropic_key():
     try:
         for _section, vals in st.secrets.items():
             if isinstance(vals, dict):
-                for name in ASSISTANT_KEY_CANDIDATES:
+                for name in candidates:
                     v = vals.get(name, '')
                     if v:
                         return str(v).strip()
     except Exception:
         pass
     return ''
+
+
+def get_anthropic_key():
+    return get_secret_key(ASSISTANT_KEY_CANDIDATES)
+
+
+def get_gemini_key():
+    return get_secret_key(GEMINI_KEY_CANDIDATES)
 
 ASSISTANT_TOOLS = [
     {
@@ -861,6 +872,57 @@ def run_assistant_loop(history, tool_map, api_key):
                 'type': 'tool_result', 'tool_use_id': block['id'],
                 'content': str(result)[:8000],
             }]})
+    return 'No pude completar la consulta. Intenta de nuevo.'
+
+
+def run_assistant_gemini(history, tool_map, api_key):
+    """Google Gemini generateContent + function calling; returns final text."""
+    url = (f'https://generativelanguage.googleapis.com/v1beta/models/'
+           f'{GEMINI_MODEL}:generateContent')
+    gemini_tools = [{'functionDeclarations': [
+        {'name': t['name'], 'description': t['description'],
+         'parameters': t['input_schema']} for t in ASSISTANT_TOOLS]}]
+    contents = []
+    for role, text in history:
+        if not text:
+            continue
+        contents.append({'role': 'user' if role == 'user' else 'model',
+                         'parts': [{'text': text}]})
+    for _ in range(6):
+        body = {'system_instruction': {'parts': [{'text': ASSISTANT_SYSTEM}]},
+                'contents': contents, 'tools': gemini_tools}
+        try:
+            r = requests.post(url, params={'key': api_key}, json=body, timeout=180)
+        except requests.exceptions.RequestException as e:
+            return f'Error al consultar la API de Gemini: {e}'
+        if r.status_code == 429:
+            time.sleep(5)
+            continue
+        if r.status_code != 200:
+            return (f'Error de la API de Gemini ({r.status_code}). Revisa que '
+                    f'GEMINI_API_KEY sea valida.')
+        data = r.json()
+        cands = data.get('candidates') or []
+        if not cands:
+            return 'No tengo datos sobre eso.'
+        parts = cands[0].get('content', {}).get('parts', []) or []
+        fcall = None
+        texts = []
+        for p in parts:
+            if 'functionCall' in p:
+                fcall = p['functionCall']
+            elif 'text' in p:
+                texts.append(p['text'])
+        if not fcall:
+            return '\n'.join(texts).strip() or 'No tengo datos sobre eso.'
+        name = fcall.get('name', '')
+        args = fcall.get('args') or {}
+        result = (tool_map[name](**args) if name in tool_map
+                  else 'Herramienta desconocida')
+        contents.append({'role': 'model', 'parts': parts})
+        contents.append({'role': 'user', 'parts': [{
+            'functionResponse': {'name': name,
+                                 'response': {'result': str(result)[:8000]}}}]})
     return 'No pude completar la consulta. Intenta de nuevo.'
 
 
@@ -1372,19 +1434,26 @@ def main():
                    '(FIRMS/NASA y MapBiomas Alerta Peru). Si no tiene datos, lo '
                    'dice y nunca inventa cifras. Fuente y fecha siempre citadas.')
         api_key = get_anthropic_key()
-        if not api_key:
+        gemini_key = get_gemini_key()
+        provider = 'gemini' if gemini_key else ('claude' if api_key else None)
+        if not provider:
             st.warning(
-                '**Asistente desactivado: falta la API key de Anthropic.**\n\n'
-                'Para activarlo en **Streamlit Cloud**:\n'
-                '1. Abre **esta app** (fire-dt-ucayali-owy9tde2pauka5m9xjlgy4) '
-                'y entra a **Settings > Secrets**.\n'
-                '2. Agrega la linea:\n\n'
+                '**Asistente desactivado: falta una API key (Anthropic o Google '
+                'Gemini).**\n\n'
+                'Con **Google Gemini** (gratis, sin tarjeta):\n'
+                '1. Obtén la key en https://aistudio.google.com/apikey\n'
+                '2. En Streamlit Cloud > Settings > Secrets agrega:\n\n'
+                '```toml\nGEMINI_API_KEY = "AIza..."\n```\n\n'
+                'Con **Anthropic Claude**:\n'
+                '1. Key en https://console.anthropic.com (API keys)\n'
+                '2. En Secrets agrega:\n\n'
                 '```toml\nANTHROPIC_API_KEY = "sk-ant-..."\n```\n\n'
-                '3. Presiona **Save**. La app se reinicia sola; si no, '
-                'recarga la pagina. (Tambien acepta anthropic_api_key o '
-                'ANTHROPIC_KEY, y variables de entorno.)')
+                '3. Presiona **Save** (reinicia sola) y recarga la pagina. '
+                'Si hay ambas keys, se usa Gemini.')
         else:
-            st.caption('Asistente conectado (clave cargada).')
+            st.caption('Asistente conectado: **Google Gemini**.'
+                       if provider == 'gemini' else
+                       'Asistente conectado: **Anthropic Claude**.')
             tool_map = {
                 'consultar_focos_calor':
                     lambda **kw: tool_focos_calor(df, **kw),
@@ -1404,8 +1473,12 @@ def main():
                 st.session_state.chat_history.append(('user', prompt))
                 with st.chat_message('assistant'):
                     with st.spinner('Consultando datos reales...'):
-                        answer = run_assistant_loop(
-                            st.session_state.chat_history, tool_map, api_key)
+                        if provider == 'gemini':
+                            answer = run_assistant_gemini(
+                                st.session_state.chat_history, tool_map, gemini_key)
+                        else:
+                            answer = run_assistant_loop(
+                                st.session_state.chat_history, tool_map, api_key)
                     st.markdown(answer)
                 st.session_state.chat_history.append(('assistant', answer))
 
