@@ -79,6 +79,16 @@ ANP_FILES = {
 }
 DEPARTMENTS_PATH = _first_existing('peru_departamentos_light.geojson', 'peru_departamentos.geojson')
 
+DEFOREST_PATH = DATA_DIR / 'deforest_mapbiomas_alerta.parquet'
+DEF_NEAR_KM = 5.0
+DEF_DAYS = 60
+
+MONTH_NAMES = {1: 'enero', 2: 'febrero', 3: 'marzo', 4: 'abril', 5: 'mayo',
+               6: 'junio', 7: 'julio', 8: 'agosto', 9: 'septiembre',
+               10: 'octubre', 11: 'noviembre', 12: 'diciembre'}
+MONTH_NAMES_SHORT = ['', 'Ene', 'Feb', 'Mar', 'Abr', 'May', 'Jun',
+                     'Jul', 'Ago', 'Sep', 'Oct', 'Nov', 'Dic']
+
 DATE_START = '2020-01-01'
 MAP_CENTER = [-9.2, -74.5]
 MAP_ZOOM = 5
@@ -207,6 +217,16 @@ def load_anps():
                 'path': ring,
             })
     return all_polys
+
+
+@st.cache_resource(show_spinner='Cargando alertas de deforestacion (MapBiomas Alerta Peru)...')
+def load_deforest():
+    if not DEFOREST_PATH.exists():
+        return None
+    df = pd.read_parquet(DEFOREST_PATH)
+    for c in ('detected_at', 'published_at'):
+        df[c] = pd.to_datetime(df[c], errors='coerce')
+    return df
 
 
 @st.cache_resource(show_spinner='Cargando departamentos...')
@@ -432,6 +452,39 @@ def priority_rank(df):
     return df.drop(columns='_porder')
 
 
+def recent_deforest(df_def, days=60):
+    """Alerts published within the last `days` (relative to the newest alert)."""
+    if df_def is None or df_def.empty:
+        return pd.DataFrame(), None
+    ref = df_def['published_at'].max()
+    recent = df_def[df_def['published_at'] >= ref - pd.Timedelta(days=days)]
+    return recent.copy(), ref
+
+
+def compute_deforest_proximity(df, def_df, radius_km=DEF_NEAR_KM):
+    """Distance (km) from each hotspot to the nearest deforestation alert."""
+    out = df.copy()
+    out['nearest_def_km'] = np.nan
+    out['nearest_def_date'] = ''
+    out['nearest_def_area'] = np.nan
+    out['nearest_def_code'] = 0
+    if df.empty or def_df is None or len(def_df) == 0:
+        return out
+    lat = df['latitude'].values
+    lon = df['longitude'].values
+    buckets = build_centroid_buckets(def_df['lat'].values, def_df['lon'].values)
+    d, i = nearest_centroid_bucketed(lat, lon, def_df['lat'].values,
+                                     def_df['lon'].values, buckets)
+    within = d <= radius_km
+    out['nearest_def_km'] = np.round(d, 1)
+    out['nearest_def_code'] = def_df['alert_code'].values[i]
+    out['nearest_def_date'] = def_df['published_at'].values[i]
+    out['nearest_def_area'] = def_df['area_ha'].values[i]
+    out.loc[~within, ['nearest_def_km', 'nearest_def_code',
+                      'nearest_def_date', 'nearest_def_area']] = [np.nan, 0, '', np.nan]
+    return out
+
+
 def build_heatmap_time_data(df, granularity='W', max_points=8000):
     if df.empty:
         return [], []
@@ -508,16 +561,48 @@ def hotspot_color(conf):
 
 def build_hotspot_map(df, com_cent, com_polys, anp_polys, dpt_polys, dpt_names,
                       show_com=True, show_anp=True, show_dpt=True, title_suffix='',
-                      color_by='conf'):
+                      color_by='conf', recent_def=None, show_def_layer=True):
     m = folium.Map(location=MAP_CENTER, zoom_start=MAP_ZOOM, tiles='CartoDB positron')
     m = add_context_layers(m, com_cent, com_polys, anp_polys, dpt_polys, dpt_names,
                            show_com, show_anp, show_dpt)
 
+    if show_def_layer and recent_def is not None and len(recent_def) > 0:
+        fg_def = folium.FeatureGroup(
+            name=f'Deforestacion reciente (MapBiomas Alerta, {len(recent_def):,})',
+            show=True)
+        for _, arow in recent_def.iterrows():
+            box = str(arow.get('bbox') or '')
+            pop_txt = (f"<b>Alerta {arow.get('alert_code', '')}</b><br>"
+                       f"<b>Publicada:</b> {arow.get('published_at', ''):%d/%m/%Y}<br>"
+                       f"<b>Detectada:</b> {arow.get('detected_at', ''):%d/%m/%Y}<br>"
+                       f"<b>Area:</b> {arow.get('area_ha', 0):.1f} ha")
+            folium.CircleMarker(
+                location=[arow['lat'], arow['lon']],
+                radius=3, color='#145a32', weight=2, fill=True,
+                fill_color='#145a32', fill_opacity=0.7,
+                popup=folium.Popup(pop_txt, max_width=260)
+            ).add_to(fg_def)
+            if box:
+                try:
+                    xmin, ymin, xmax, ymax = [float(v) for v in box.split(',')[:4]]
+                    folium.Rectangle(
+                        bounds=[[ymin, xmin], [ymax, xmax]],
+                        color='#145a32', weight=1, fill=True,
+                        fill_opacity=0.12, popup=folium.Popup(pop_txt, max_width=260)
+                    ).add_to(fg_def)
+                except Exception:
+                    pass
+        fg_def.add_to(m)
+
     fg = folium.FeatureGroup(name=f'Focos ({len(df):,})')
     sample = df.sample(min(2000, len(df)), random_state=42) if len(df) > 2000 else df
+    def_flagged = 0
     for _, row in sample.iterrows():
         if 'is_valid' in row and not row['is_valid']:
             color, radius, fill = '#95a5a6', 3, 0.4
+        elif 'nearest_def_km' in row.index and pd.notna(row.get('nearest_def_km')):
+            color, radius, fill = '#8e24aa', 7, 0.9
+            def_flagged += 1
         elif color_by == 'tier' and row.get('tier'):
             tier = str(row['tier'])
             if 'CRITICO' in tier:
@@ -531,6 +616,14 @@ def build_hotspot_map(df, com_cent, com_polys, anp_polys, dpt_polys, dpt_names,
         else:
             color = hotspot_color(row.get('confidence', ''))
             radius, fill = 3, 0.55
+        def_line = ''
+        if 'nearest_def_km' in row.index and pd.notna(row.get('nearest_def_km')):
+            def_line = (f"<br><b style='color:#8e24aa;'>Def. reciente:</b> "
+                        f"alerta {row.get('nearest_def_code', '')} "
+                        f"({row.get('nearest_def_date', ''):%d/%m/%Y}, "
+                        f"{row.get('nearest_def_area', 0):.1f} ha) a "
+                        f"{row.get('nearest_def_km', 0):.1f} km "
+                        f"(posible quema post-tala)")
         popup = (f"<b>{row['acq_date'].strftime('%d/%m/%Y')}</b><br>"
                  f"<b>FRP:</b> {row.get('frp', 'N/A')} MW<br>"
                  f"<b>Confianza:</b> {row.get('confidence', 'N/A')}<br>"
@@ -543,7 +636,8 @@ def build_hotspot_map(df, com_cent, com_polys, anp_polys, dpt_polys, dpt_names,
                  f"<b>ANP mas cercana:</b> {row.get('nearest_anp', '')} "
                  f"({row.get('dist_anp_km', '')} km)<br>"
                  f"<b>Dentro de ANP:</b> {row.get('inside_anp', '')}<br>"
-                 f"<b>Coords:</b> {row['latitude']:.4f}, {row['longitude']:.4f}")
+                 f"<b>Coords:</b> {row['latitude']:.4f}, {row['longitude']:.4f}"
+                 f"{def_line}")
         folium.CircleMarker(
             location=[row['latitude'], row['longitude']],
             radius=radius, color=color, fill=True, fill_opacity=fill,
@@ -561,6 +655,8 @@ def build_hotspot_map(df, com_cent, com_polys, anp_polys, dpt_polys, dpt_names,
     else:
         marker_legend = ('<span style="color: red;">●</span> Alta/Nominal confianza<br>'
                          '<span style="color: orange;">●</span> Baja confianza<br>')
+    if def_flagged:
+        marker_legend += '<span style="color: #8e24aa;">●</span> Foco con deforestacion reciente cercana<br>'
     legend_html = f"""
     <div style="position: fixed; bottom: 30px; left: 30px; z-index: 1000;
          background-color: white; padding: 10px 12px; border-radius: 8px;
@@ -572,7 +668,8 @@ def build_hotspot_map(df, com_cent, com_polys, anp_polys, dpt_polys, dpt_names,
         <span style="color: #1e8449;">■</span> ANP Nacional / ZR<br>
         <span style="color: #2e86c1;">■</span> ACR<br>
         <span style="color: #8e44ad;">■</span> ACP<br>
-        <span style="color: #e67e22;">●</span> Comunidad nativa (MINAM)
+        <span style="color: #e67e22;">●</span> Comunidad nativa (MINAM)<br>
+        <span style="color: #145a32;">●</span> Alerta deforestacion reciente
         {('<br><span style="color:#555; font-size:10px;">' + title_suffix + '</span>') if title_suffix else ''}
     </div>
     """
@@ -611,10 +708,12 @@ def main():
         com_cent, com_polys = load_communities()
         anp_polys = load_anps()
         dpt_polys, dpt_names = load_departments()
+        def_all = load_deforest()
     if df is None:
         st.error('No se encontraron datos FIRMS nacionales. Ejecuta '
                  'scripts/build_firms_peru.py primero.')
         st.stop()
+    def_recent, def_ref = recent_deforest(def_all, DEF_DAYS)
 
     # Precompute grids once
     com_buckets = build_centroid_buckets(com_cent['centroid_lat'].values,
@@ -641,6 +740,13 @@ def main():
         show_com = st.checkbox('Mostrar comunidades nativas (MINAM)', value=False)
         show_anp = st.checkbox('Mostrar areas protegidas (SERNANP)', value=True)
         show_dpt = st.checkbox('Mostrar departamentos', value=False)
+        show_def = st.checkbox(f'Mostrar alertas de deforestacion (MapBiomas Alerta, '
+                               f'ultimos {DEF_DAYS} dias)', value=False)
+        if def_all is None:
+            st.warning('Datos de deforestacion no disponibles: falta '
+                       'data/deforest_mapbiomas_alerta.parquet. La capa de '
+                       'deforestacion estara desactivada.')
+            show_def = False
 
         st.markdown('---')
         st.caption('**Fuentes de datos**')
@@ -649,6 +755,9 @@ def main():
         st.caption('Comunidades: MINAM GeoServidor (ServicioTematico/30)')
         st.caption('ANP: SERNANP geoservicios (ANP/ZR/ACR/ACP)')
         st.caption('Departamentos: GeoBoundaries ADM1')
+        if def_all is not None:
+            st.caption(f'Deforestacion: MapBiomas Alerta Peru (ultima '
+                       f'publicacion {def_ref:%d/%m/%Y})')
         st.caption('Filtro falsos positivos: tipo no-vegetacion + confianza '
                    f'(MODIS<{MODIS_CONF_MIN}, VIIRS low) + FRP<={FRP_MIN} + '
                    f'radio de volcan {VOLCANO_RADIUS_KM:.0f} km')
@@ -681,8 +790,9 @@ def main():
             prio_set, com_cent, com_polys, anp_polys,
             com_buckets, poly_buckets_anp, poly_buckets_com, poly_buckets_anp))
 
-    tab1, tab2, tab3, tab4 = st.tabs(
-        ['Mapa de focos', 'Priorizacion', 'Falsos positivos', 'Resumen'])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(
+        ['Mapa de focos', 'Priorizacion', 'Falsos positivos', 'Resumen',
+         'Deforestacion'])
 
     # ---------------- TAB 1: MAP ----------------
     with tab1:
@@ -691,13 +801,26 @@ def main():
         sample_map = compute_proximity(sample_map, com_cent, com_polys, anp_polys,
                                        com_buckets, poly_buckets_anp,
                                        poly_buckets_com, poly_buckets_anp)
+        sample_map = compute_deforest_proximity(sample_map, def_recent, DEF_NEAR_KM)
         m = build_hotspot_map(sample_map, com_cent, com_polys, anp_polys,
                               dpt_polys, dpt_names,
-                              show_com=show_com, show_anp=show_anp, show_dpt=show_dpt)
+                              show_com=show_com, show_anp=show_anp, show_dpt=show_dpt,
+                              recent_def=def_recent if show_def else None,
+                              show_def_layer=show_def)
         st_folium(m, width='100%', height=620)
+        n_def_marks = int(sample_map['nearest_def_km'].notna().sum())
         st.caption(f'{len(filtered):,} focos en el periodo. Muestra aleatoria hasta 2000 '
                    'puntos en el mapa para mantener la fluidez. Ver capa '
                    '"Focos (n)" y detalles al hacer clic.')
+        if show_def and def_all is not None:
+            if n_def_marks:
+                st.success(f'**{n_def_marks:,}** focos de la muestra tienen una alerta de '
+                           f'deforestacion reciente (MapBiomas Alerta, ultimos {DEF_DAYS} '
+                           f'dias) a menos de {DEF_NEAR_KM:g} km -> posible **quema '
+                           f'post-tala**. Se muestran en **violeta**.')
+            else:
+                st.info(f'Ningun foco de la muestra tiene deforestacion reciente a menos '
+                        f'de {DEF_NEAR_KM:g} km.')
 
         st.markdown('---')
         st.subheader('Animacion temporal de intensidad (FRP)')
@@ -751,20 +874,34 @@ def main():
         c3.metric(TIER_MOD, f'{tier_counts.get(TIER_MOD, 0):,}')
         c4.metric(TIER_BAS, f'{tier_counts.get(TIER_BAS, 0):,}')
 
+        ranked = compute_deforest_proximity(ranked, def_recent, DEF_NEAR_KM)
+        n_def_top = int(ranked.head(100)['nearest_def_km'].notna().sum())
+        if show_def and def_all is not None:
+            if n_def_top:
+                st.info(f'**{n_def_top} de los top 100 focos** tienen una alerta de '
+                        f'deforestacion reciente a menos de {DEF_NEAR_KM:g} km '
+                        '(posible quema post-tala; marcados en violeta en el mapa).')
+            else:
+                st.info('Ninguno de los top 100 focos tiene deforestacion reciente '
+                        f'a menos de {DEF_NEAR_KM:g} km.')
+
         show_top = st.selectbox('Cuandos mostrar', [100, 250, 500, 1000], index=2)
         top = ranked.head(show_top).copy()
 
         disp = top[[
             'acq_date', 'zone', 'latitude', 'longitude', 'confidence', 'frp',
             '_source', 'nearest_com', 'dist_com_km', 'nearest_anp', 'dist_anp_km',
-            'inside_com', 'inside_anp', 'tier'
+            'inside_com', 'inside_anp', 'tier', 'nearest_def_km', 'nearest_def_code',
+            'nearest_def_date', 'nearest_def_area'
         ]].rename(columns={
             'acq_date': 'Fecha', 'zone': 'Departamento', 'latitude': 'Lat',
             'longitude': 'Lon', 'confidence': 'Confianza', 'frp': 'FRP (MW)',
             '_source': 'Sensor', 'nearest_com': 'Comunidad cercana',
             'dist_com_km': 'Dist. comunidad (km)', 'nearest_anp': 'ANP cercana',
             'dist_anp_km': 'Dist. ANP (km)', 'inside_com': 'Dentro de comunidad',
-            'inside_anp': 'Dentro de ANP', 'tier': 'Prioridad'
+            'inside_anp': 'Dentro de ANP', 'tier': 'Prioridad',
+            'nearest_def_km': 'Def. reciente (km)', 'nearest_def_code': 'Alerta def.',
+            'nearest_def_date': 'Alerta def. publicada', 'nearest_def_area': 'Alerta def. (ha)'
         })
         disp['Fecha'] = disp['Fecha'].dt.strftime('%d/%m/%Y')
         disp = disp.fillna('')
@@ -779,7 +916,9 @@ def main():
         m2 = build_hotspot_map(ranked.head(100), com_cent, com_polys, anp_polys,
                                dpt_polys, dpt_names,
                                show_com=True, show_anp=True, show_dpt=False,
-                               title_suffix='Top 100 por prioridad', color_by='tier')
+                               title_suffix='Top 100 por prioridad', color_by='tier',
+                               recent_def=def_recent if show_def else None,
+                               show_def_layer=show_def)
         st_folium(m2, width='100%', height=600)
         st.caption('La priorizacion se calcula sobre los '
                    f'{min(len(valid_fires), PRIORITY_MAX_POINTS):,} focos validos '
@@ -826,23 +965,196 @@ def main():
             ex_disp['Fecha'] = ex_disp['Fecha'].dt.strftime('%d/%m/%Y')
             st.dataframe(ex_disp, height=420, width='stretch')
 
+    # ---------------- TAB 5: DEFORESTACION ----------------
+    with tab5:
+        st.subheader('Deforestacion reciente como contexto de focos de calor')
+        if def_all is None or def_all.empty:
+            st.info('Datos de deforestacion no disponibles. Descarga el dataset con '
+                    'scripts/build_deforest_data.py y colocalo en '
+                    'data/deforest_mapbiomas_alerta.parquet.')
+        else:
+            st.markdown(
+                'Alertas de **MapBiomas Alerta Peru** (WFS publico). Las alertas '
+                'recientes junto a focos de calor sugieren **quemas post-tala**: la '
+                'vegetacion talada se seca y se quema en las siguientes semanas.')
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric('Alertas en el dataset', f'{len(def_all):,}')
+            c2.metric('Area total', f"{def_all['area_ha'].sum():,.0f} ha")
+            c3.metric('Ultimas 30 dias', f"{len(def_all[def_all['published_at'] >= def_all['published_at'].max() - pd.Timedelta(days=30)]):,}")
+            c4.metric('Ultima publicacion', f"{def_all['published_at'].max():%d/%m/%Y}")
+            st.caption('El dataset cubre el periodo '
+                       f"{def_all['detected_at'].min():%d/%m/%Y} - "
+                       f"{def_all['detected_at'].max():%d/%m/%Y} (deteccion). "
+                       'El analisis de proximidad con focos usa las ultimas '
+                       f'{DEF_DAYS} publicaciones ({DEF_NEAR_KM:g} km).')
+
+            st.markdown('---')
+            st.markdown('#### Proximidad de focos del periodo a alertas recientes')
+            prox = compute_deforest_proximity(filtered, def_recent, DEF_NEAR_KM)
+            n_near = int(prox['nearest_def_km'].notna().sum())
+            cA, cB, cC = st.columns(3)
+            cA.metric(f'Focos a <={DEF_NEAR_KM:g} km de una alerta',
+                      f'{n_near:,} ({100 * n_near / max(len(prox), 1):.1f}%)')
+            cB.metric('Distancia media a la alerta mas cercana (km)',
+                      f'{prox["nearest_def_km"].mean():.1f}' if n_near else 'n/a')
+            cC.metric('Area media de la alerta cercana',
+                      f'{prox["nearest_def_area"].mean():.1f} ha' if n_near else 'n/a')
+            if n_near:
+                st.markdown(
+                    f'**{n_near:,}** focos del periodo seleccionado co-ocurren con '
+                    f'deforestacion reciente a menos de {DEF_NEAR_KM:g} km. El patron '
+                    'espacio-temporal (tala en estacion seca + quema semanas despues) '
+                    'es consistente con **quemas post-tala** (patron MAAP).')
+                near_disp = prox[prox['nearest_def_km'].notna()][[
+                    'acq_date', 'zone', 'latitude', 'longitude', 'frp', 'tier',
+                    'nearest_def_km', 'nearest_def_code', 'nearest_def_date',
+                    'nearest_def_area'
+                ]].sort_values('nearest_def_km').head(200).rename(columns={
+                    'acq_date': 'Fuego (fecha)', 'zone': 'Departamento',
+                    'latitude': 'Lat', 'longitude': 'Lon', 'frp': 'FRP (MW)',
+                    'tier': 'Prioridad', 'nearest_def_km': 'Dist. alerta (km)',
+                    'nearest_def_code': 'Cod. alerta', 'nearest_def_date': 'Alerta publicada',
+                    'nearest_def_area': 'Area alerta (ha)'
+                })
+                near_disp['Fuego (fecha)'] = near_disp['Fuego (fecha)'].dt.strftime('%d/%m/%Y')
+                st.dataframe(near_disp, height=420, width='stretch')
+
+            st.markdown('---')
+            st.markdown('#### Mapa de alertas recientes')
+            m_def = folium.Map(location=MAP_CENTER, zoom_start=MAP_ZOOM,
+                               tiles='CartoDB positron')
+            if len(def_recent) > 0:
+                sample_def = def_recent.sample(min(3000, len(def_recent)),
+                                               random_state=42)
+                for _, arow in sample_def.iterrows():
+                    pop_txt = (f"<b>Alerta {arow.get('alert_code', '')}</b><br>"
+                               f"<b>Publicada:</b> {arow.get('published_at', ''):%d/%m/%Y}<br>"
+                               f"<b>Detectada:</b> {arow.get('detected_at', ''):%d/%m/%Y}<br>"
+                               f"<b>Area:</b> {arow.get('area_ha', 0):.1f} ha")
+                    folium.CircleMarker(
+                        location=[arow['lat'], arow['lon']], radius=3,
+                        color='#145a32', weight=2, fill=True,
+                        fill_color='#145a32', fill_opacity=0.7,
+                        popup=folium.Popup(pop_txt, max_width=260)).add_to(m_def)
+            folium.TileLayer('OpenStreetMap').add_to(m_def)
+            folium.LayerControl().add_to(m_def)
+            st_folium(m_def, width='100%', height=520)
+            st.caption(f'Alertas publicadas en los ultimos {DEF_DAYS} dias '
+                       f'(hasta {def_ref:%d/%m/%Y}).')
+
+            st.markdown('---')
+            st.markdown('#### Tendencia de alertas por mes')
+            def_trend = def_all.groupby(def_all['published_at'].dt.to_period('M')).agg(
+                alertas=('alert_code', 'nunique'), area_ha=('area_ha', 'sum')
+            ).reset_index()
+            def_trend['periodo'] = def_trend['published_at'].astype(str)
+            fig = px.bar(def_trend.tail(24), x='periodo', y='alertas',
+                         title='Alertas de deforestacion publicadas por mes',
+                         labels={'periodo': 'Mes', 'alertas': 'Alertas'},
+                         color_discrete_sequence=['#145a32'])
+            fig.update_layout(height=360, xaxis_tickangle=-45)
+            st.plotly_chart(fig, width='stretch')
+
+            csv_def = def_all.to_csv(index=False).encode('utf-8-sig')
+            st.download_button('Descargar alertas de deforestacion (CSV)', csv_def,
+                               'deforest_mapbiomas_alerta.csv', 'text/csv')
+
     # ---------------- TAB 4: SUMMARY ----------------
     with tab4:
         st.subheader('Resumen')
         valid = filtered_all[filtered_all['is_valid']]
-        c1, c2, c3 = st.columns(3)
-        c1.metric('Focos validos', f'{len(valid):,}')
-        c2.metric('Departamentos con fuego', f'{valid["zone"].nunique()}')
-        c3.metric('FRP medio (MW)', f'{valid["frp"].mean():.1f}')
+        n_valid = len(valid)
 
-        if len(valid) > 0:
-            by_dpt = valid.groupby('zone').size().reset_index(name='focos').sort_values(
-                'focos', ascending=False)
-            fig = px.bar(by_dpt.head(15), x='focos', y='zone', orientation='h',
-                         title='Focos validos por departamento',
-                         color_discrete_sequence=['#e74c3c'])
-            fig.update_layout(xaxis_title='Focos', yaxis_title='', height=500)
-            st.plotly_chart(fig, width='stretch')
+        if n_valid == 0:
+            st.info('Sin focos validos en la seleccion actual.')
+        else:
+            max_d = valid['acq_date'].max()
+            last30 = valid[valid['acq_date'] >= max_d - pd.Timedelta(days=30)]
+            months = valid['acq_date'].dt.month
+            peak = months.value_counts().idxmax()
+            by_dpt = valid.groupby('zone').size().sort_values(ascending=False)
+            frp_mean = valid['frp'].mean()
+
+            # ---- Key metrics ----
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric('Total focos validos', f'{n_valid:,}')
+            c2.metric('Ultimos 30 dias', f'{len(last30):,}')
+            c3.metric('Departamentos con fuego', f'{by_dpt.size:,}')
+            c4.metric('Mes pico', MONTH_NAMES[peak].capitalize())
+            c5.metric('FRP medio (MW)', f'{frp_mean:.1f}')
+            st.caption(f"Ultimo dato: {max_d:%d/%m/%Y} | Ultimos 30 dias cuentan focos "
+                       f"del {max_d - pd.Timedelta(days=30):%d/%m/%Y} al {max_d:%d/%m/%Y}.")
+
+            # ---- Coverage + temporal pattern ----
+            st.markdown('---')
+            col_i, col_j = st.columns(2)
+            with col_i:
+                st.markdown('#### Cobertura de datos')
+                sens = []
+                if 'type' in valid:
+                    sens = (['VIIRS (S-NPP, NOAA-20/21)' if (valid['type'] == 0).any()
+                             else None,
+                             'MODIS (Aqua/Terra)' if (valid['type'] == 1).any()
+                             else None])
+                    sens = [s for s in sens if s]
+                st.markdown(f"- **Periodo**: {valid['acq_date'].min():%d/%m/%Y} - "
+                            f"{max_d:%d/%m/%Y}")
+                st.markdown(f"- **Total focos validos**: {n_valid:,}")
+                st.markdown('- **Sensores**: ' + (', '.join(sens) if sens else 'n/d'))
+                st.markdown('- **Area**: Todo el Peru')
+            with col_j:
+                st.markdown('#### Patron temporal')
+                st.markdown(f"- **Mes pico**: {MONTH_NAMES[peak].capitalize()} "
+                            f"({months.value_counts()[peak]:,} focos)")
+                st.markdown('- **Temporada alta (seca)**: junio - octubre')
+                st.markdown('- **Temporada baja (lluvias)**: diciembre - marzo')
+
+            # ---- Statistics by year ----
+            st.markdown('---')
+            st.markdown('#### Focos por anio')
+            yearly = valid['acq_date'].dt.year.value_counts().sort_index()
+            for y, count in yearly.items():
+                st.progress(count / yearly.max(),
+                            text=f'{int(y)}: {count:,} focos '
+                                 f'({count / n_valid * 100:.1f}% del total)')
+
+            # ---- Monthly series + seasonal average ----
+            col_a, col_b = st.columns(2)
+            tmp = valid.copy()
+            tmp['ym'] = tmp['acq_date'].dt.to_period('M').astype(str)
+            tmp['m'] = months
+            serie = tmp.groupby('ym').size()
+            seasonal = tmp.groupby(['ym', 'm']).size().groupby('m').mean()
+            with col_a:
+                fig = px.bar(serie, title='Focos por mes',
+                             labels={'index': 'Mes', 'value': 'Focos'},
+                             color_discrete_sequence=['#e74c3c'])
+                fig.update_layout(xaxis_tickangle=-45, height=360,
+                                  xaxis_title='', yaxis_title='Focos')
+                st.plotly_chart(fig, width='stretch')
+            with col_b:
+                fig2 = px.bar(seasonal, title='Promedio estacional (focos por mes, '
+                                              'promedio anual)',
+                              labels={'index': 'Mes', 'value': 'Focos promedio'},
+                              color_discrete_sequence=['#c0392b'])
+                fig2.update_xaxes(tickmode='array',
+                                  tickvals=list(range(1, 13)),
+                                  ticktext=MONTH_NAMES_SHORT[1:])
+                fig2.update_layout(height=360, xaxis_title='', yaxis_title='Focos')
+                st.plotly_chart(fig2, width='stretch')
+
+            # ---- Top zones ----
+            st.markdown('---')
+            st.markdown('#### Departamentos con mas focos')
+            top = by_dpt.head(5)
+            cols = st.columns(5)
+            for col, (z, count) in zip(cols, top.items()):
+                col.metric(str(z), f'{count:,}',
+                           f'{count / n_valid * 100:.1f}%')
+            topdf = by_dpt.head(10).reset_index()
+            topdf.columns = ['Departamento', 'Focos']
+            topdf['% del total'] = (topdf['Focos'] / n_valid * 100).round(1)
+            st.dataframe(topdf, width='stretch')
 
         if UPDATE_LOG.exists():
             with open(UPDATE_LOG) as f:
