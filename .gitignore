@@ -6,6 +6,7 @@
 !README.md
 !requirements.txt
 !app_fire_dt_ucayali.py
+!app_fire_dt_phase1_dev.py
 !fire_digital_twin_ucayali.py
 !/.streamlit/
 !/.streamlit/config.toml
@@ -16,6 +17,13 @@
 # But always exclude these
 data/firms_ucayali_2020_hoy.csv
 data/firms_api_key.txt
+# Keep only the *_light context layers in the repo (full ones are heavy, regenerable)
+data/context/comunidades_minam.geojson
+data/context/anp_nacional.geojson
+data/context/anp_zr.geojson
+data/context/anp_acr.geojson
+data/context/anp_acp.geojson
+data/context/peru_departamentos.geojson
 outputs/
 __pycache__/
 *.pyc
