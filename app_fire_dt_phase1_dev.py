@@ -689,12 +689,16 @@ def build_hotspot_map(df, com_cent, com_polys, anp_polys, dpt_polys, dpt_names,
 ASSISTANT_SYSTEM = (
     'Eres el asistente de datos del Digital Twin de Incendios Forestales del '
     'Perú. Respondes EXCLUSIVAMENTE con datos reales devueltos por tus '
-    'herramientas. Si una herramienta no devuelve datos, responde: "No tengo '
-    'datos sobre eso." Nunca inventes cifras, fechas, departamentos ni fuentes. '
-    'Cita siempre la fuente (FIRMS/NASA o MapBiomas Alerta Perú) y la fecha del '
-    'dato. Usa siempre ortografía correcta en español (con acentos y ñ, por '
-    'ejemplo: "año", "últimos", "días"). Responde en español, corto y '
-    'concreto, en 2-4 frases.')
+    'herramientas; usa siempre una herramienta, nunca respondas de memoria. '
+    'Cuando respondas sobre focos de calor cita la fuente (FIRMS/NASA) y la '
+    'fecha del dato; cuando respondas sobre deforestación cita MapBiomas Alerta '
+    'Perú. Si una herramienta no devuelve datos, responde "No tengo datos sobre '
+    'eso" y de inmediato sugiere qué sí puedes consultar (focos de calor por '
+    'departamento o rango de fechas, FRP medio, mes pico, top de departamentos, '
+    'o alertas de deforestación por departamento o por días recientes). Nunca '
+    'inventes cifras, fechas, departamentos ni fuentes. Usa siempre ortografía '
+    'correcta en español (con acentos y ñ, por ejemplo: "año", "últimos", '
+    '"días"). Responde en español, corto y concreto, en 2-4 frases.')
 
 
 def norm_dept(s):
@@ -1392,7 +1396,7 @@ def main():
 
             # ---- Statistics by year ----
             st.markdown('---')
-            st.markdown('#### Focos por anio')
+            st.markdown('#### Focos por año')
             yearly = valid['acq_date'].dt.year.value_counts().sort_index()
             for y, count in yearly.items():
                 st.progress(count / yearly.max(),
@@ -1475,31 +1479,51 @@ def main():
                     lambda **kw: tool_deforestacion(def_all, **kw),
             }
 
-            with st.expander('¿Qué puedo preguntar?', expanded=False):
+            with st.expander('¿Qué datos tengo y qué preguntas puedo hacer?',
+                             expanded=True):
                 st.markdown(
-                    '- **Focos de calor (FIRMS/NASA):** cuántos focos hubo en un '
-                    'departamento o en un período de fechas, en qué mes hubo más '
-                    'focos, el FRP medio (intensidad), el departamento con más '
-                    'focos, los focos de los últimos 30 días.\n'
-                    '- **Deforestación (MapBiomas Alerta Perú):** cuántas alertas '
-                    'de deforestación hay por departamento, el área total '
-                    'afectada (hectáreas), y cuántas se publicaron en los '
-                    'últimos días o semanas.')
+                    '**Datos disponibles:**\n'
+                    '- **Focos de calor** (FIRMS/NASA, todo el Perú 2020-presente): '
+                    'por departamento y rango de fechas.\n'
+                    '- **Alertas de deforestación** (MapBiomas Alerta Perú): por '
+                    'departamento, área en hectáreas y publicaciones recientes.\n\n'
+                    '**Tipos de preguntas** (reemplaza los [corchetes] por tus '
+                    'valores):\n'
+                    '- ¿Cuántos focos de calor hubo en **[departamento]**?\n'
+                    '- ¿Cuántos focos de calor hubo entre **[fecha inicio]** y '
+                    '**[fecha fin]**? (formato AAAA-MM-DD)\n'
+                    '- ¿En qué mes hubo más focos de calor?\n'
+                    '- ¿Cuál es el departamento con más focos de calor?\n'
+                    '- ¿Cuál es el FRP medio (intensidad) de los focos?\n'
+                    '- ¿Cuántos focos hubo en los últimos 30 días?\n'
+                    '- ¿Cuántas alertas de deforestación hay en **[departamento]**?\n'
+                    '- ¿Cuántas alertas se publicaron en los últimos **[días]**?\n'
+                    '- ¿Cuál es el área total deforestada en **[departamento]**?')
 
-            st.markdown('**Preguntas de ejemplo** (haz clic para probar):')
-            example_questions = [
-                '¿Cuántos focos de calor hubo en Ucayali?',
-                '¿Cuántos focos de calor hubo en el Perú en 2025?',
-                '¿Cuál es el departamento con más focos de calor?',
-                '¿En qué mes hubo más focos de calor?',
-                '¿Cuántas alertas de deforestación hay en Loreto?',
-                '¿Cuánta deforestación se registró en los últimos 60 días?',
+            example_queries = [
+                ('¿Cuántos focos de calor hubo en Ucayali?',
+                 lambda: tool_focos_calor(df, departamento='Ucayali')),
+                ('¿Cuántos focos de calor hubo en el Perú en 2025?',
+                 lambda: tool_focos_calor(df, fecha_inicio='2025-01-01',
+                                          fecha_fin='2025-12-31')),
+                ('¿Cuál es el departamento con más focos de calor?',
+                 lambda: tool_focos_calor(df)),
+                ('¿En qué mes hubo más focos de calor?',
+                 lambda: tool_focos_calor(df)),
+                ('¿Cuántas alertas de deforestación hay en Loreto?',
+                 lambda: tool_deforestacion(def_all, departamento='Loreto')),
+                ('¿Cuánta deforestación se registró en los últimos 60 días?',
+                 lambda: tool_deforestacion(def_all, dias=60)),
             ]
+            st.markdown('**Preguntas de ejemplo** (haz clic: responden con datos '
+                        'reales):')
             qcols = st.columns(3)
             pending = None
-            for i, q in enumerate(example_questions):
+            pending_fn = None
+            for i, (q, fn) in enumerate(example_queries):
                 if qcols[i % 3].button(q, key=f'qex_{i}'):
                     pending = q
+                    pending_fn = fn
 
             if 'chat_history' not in st.session_state:
                 st.session_state.chat_history = []
@@ -1515,7 +1539,9 @@ def main():
                 st.session_state.chat_history.append(('user', prompt))
                 with st.chat_message('assistant'):
                     with st.spinner('Consultando datos reales...'):
-                        if provider == 'gemini':
+                        if pending_fn is not None:
+                            answer = pending_fn()
+                        elif provider == 'gemini':
                             answer = run_assistant_gemini(
                                 st.session_state.chat_history, tool_map, gemini_key)
                         else:
